@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch QSE company dividend yields via API or export to Excel."""
+"""QSE dividend yield scraper with FastAPI API and optional Excel export."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Set
 
 import pandas as pd
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -32,6 +32,11 @@ NAME_SELECTOR = "#company-main-heading-companyName"
 YIELD_SELECTOR = "#qeNLSYield"
 
 TICKER_RE = re.compile(r"^[A-Z0-9]{3,6}$")
+
+CACHE_TTL_SECONDS = 1800  # 30 minutes
+
+_cache_payload: Optional[dict] = None
+_cache_time: float = 0.0
 
 
 @dataclass
@@ -117,16 +122,15 @@ def get_all_tickers(page: Page, verbose: bool = False) -> List[str]:
     for url in LISTED_COMPANIES_URLS:
         if verbose:
             print(f"Loading listed companies page: {url}")
+
         page.goto(url, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
 
-        tickers = _extract_tickers_from_links(page)
-        tickers = _filter_tickers(tickers)
+        tickers = _filter_tickers(_extract_tickers_from_links(page))
         if tickers:
             return tickers
 
-        tickers = _extract_tickers_from_table(page)
-        tickers = _filter_tickers(tickers)
+        tickers = _filter_tickers(_extract_tickers_from_table(page))
         if tickers:
             return tickers
 
@@ -143,12 +147,22 @@ def _get_text_if_exists(page: Page, selector: str, timeout_ms: int) -> Optional[
         return None
 
 
-def fetch_company_data(page: Page, ticker: str, timeout_ms: int, verbose: bool = False) -> CompanyData:
+def fetch_company_data(
+    page: Page,
+    ticker: str,
+    timeout_ms: int,
+    verbose: bool = False,
+) -> CompanyData:
     url = COMPANY_PROFILE_URL.format(code=ticker)
+
     if verbose:
         print(f"Fetching {ticker}: {url}")
-    page.goto(url, wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
+
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle")
+    except Exception:
+        return CompanyData(ticker=ticker, name=ticker, dividend_yield=None)
 
     name = _get_text_if_exists(page, NAME_SELECTOR, timeout_ms) or ticker
     dividend_yield = _get_text_if_exists(page, YIELD_SELECTOR, timeout_ms)
@@ -175,7 +189,13 @@ def _parse_dividend_yield(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
 
-    cleaned = value.replace("%", "").replace(",", "").strip()
+    cleaned = (
+        value.replace("%", "")
+        .replace(",", "")
+        .replace(" ", "")
+        .strip()
+    )
+
     try:
         return float(cleaned)
     except ValueError:
@@ -189,31 +209,56 @@ def scrape_companies(
     verbose: bool = False,
 ) -> dict:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
+        page.set_default_timeout(timeout_ms)
+        page.set_default_navigation_timeout(timeout_ms)
 
         tickers = get_all_tickers(page, verbose=verbose)
         if not tickers:
             browser.close()
             raise RuntimeError(
                 "Could not find any tickers on the listed companies page. "
-                "Check if the page markup has changed or requires additional selectors."
+                "Check if the QSE page structure changed."
             )
 
         if limit:
             tickers = tickers[:limit]
 
         results: List[CompanyData] = []
+
         for idx, ticker in enumerate(tickers, start=1):
             if verbose:
                 print(f"({idx}/{len(tickers)}) {ticker}")
+
             try:
                 data = fetch_company_data(page, ticker, timeout_ms, verbose=verbose)
                 results.append(data)
             except Exception as exc:
                 if verbose:
                     print(f"Failed to fetch {ticker}: {exc}")
-                results.append(CompanyData(ticker=ticker, name=ticker, dividend_yield=None))
+                results.append(
+                    CompanyData(
+                        ticker=ticker,
+                        name=ticker,
+                        dividend_yield=None,
+                    )
+                )
+
             time.sleep(0.3)
 
         browser.close()
@@ -231,7 +276,39 @@ def scrape_companies(
     return {
         "companies": companies,
         "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        "count": len(companies),
     }
+
+
+def get_cached_or_fresh_scrape(
+    limit: Optional[int],
+    timeout_ms: int,
+    force_refresh: bool = False,
+) -> dict:
+    global _cache_payload, _cache_time
+
+    now = time.time()
+
+    if (
+        not force_refresh
+        and limit is None
+        and _cache_payload is not None
+        and (now - _cache_time) < CACHE_TTL_SECONDS
+    ):
+        return _cache_payload
+
+    payload = scrape_companies(
+        headless=True,
+        limit=limit,
+        timeout_ms=timeout_ms,
+        verbose=False,
+    )
+
+    if limit is None:
+        _cache_payload = payload
+        _cache_time = now
+
+    return payload
 
 
 def export_to_excel(
@@ -252,8 +329,8 @@ def export_to_excel(
         [
             {
                 "Company": item["company"],
-                "Dividend Yield": item["dividendYieldRaw"],
                 "Ticker": item["ticker"],
+                "Dividend Yield": item["dividendYieldRaw"],
             }
             for item in payload["companies"]
         ]
@@ -272,15 +349,18 @@ def health() -> dict:
 
 @app.get("/scrape")
 def scrape_endpoint(
-    limit: Optional[int] = Query(default=None),
-    timeout: int = Query(default=15000),
+    limit: Optional[int] = Query(default=None, ge=1),
+    timeout: int = Query(default=15000, ge=1000, le=60000),
+    refresh: bool = Query(default=False),
 ) -> dict:
-    return scrape_companies(
-        headless=True,
-        limit=limit,
-        timeout_ms=timeout,
-        verbose=False,
-    )
+    try:
+        return get_cached_or_fresh_scrape(
+            limit=limit,
+            timeout_ms=timeout,
+            force_refresh=refresh,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -293,7 +373,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--headful",
         action="store_true",
-        help="Run browser in headful mode (useful for debugging).",
+        help="Run browser in headful mode for debugging.",
     )
     parser.add_argument(
         "--limit",
@@ -307,7 +387,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=15000,
         help="Timeout in ms for page selectors.",
     )
-    parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Verbose logging.",
+    )
     return parser.parse_args(argv)
 
 
