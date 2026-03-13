@@ -317,6 +317,8 @@ def export_to_excel(
     timeout_ms: int,
     verbose: bool,
 ) -> None:
+    import pandas as pd
+
     payload = scrape_companies(
         headless=headless,
         limit=limit,
@@ -339,7 +341,6 @@ def export_to_excel(
 
     if verbose:
         print(f"Saved: {output_path}")
-
 
 @app.get("/health")
 def health() -> dict:
